@@ -7,6 +7,7 @@ EUserv 自动续期脚本 - 多账号多线程版本
 
 import os
 import hashlib
+import html
 
 import sys
 import io
@@ -36,6 +37,31 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 logger = logging.getLogger(__name__)
+
+
+class _BufferHandler(logging.Handler):
+    """内存日志缓冲：保留最近 N 条日志，失败时可附在 TG 通知里方便定位。"""
+    def __init__(self, capacity: int = 300):
+        super().__init__()
+        self.capacity = capacity
+        self.records = []  # list of (levelno, formatted_str)
+        self.setFormatter(logging.Formatter(
+            '%(asctime)s %(levelname)s: %(message)s', datefmt='%H:%M:%S'))
+
+    def emit(self, record):
+        try:
+            self.records.append((record.levelno, self.format(record)))
+            if len(self.records) > self.capacity:
+                self.records.pop(0)
+        except Exception:
+            pass
+
+    def tail(self, level: int = logging.WARNING, limit: int = 12):
+        return [line for lv, line in self.records if lv >= level][-limit:]
+
+
+LOG_BUFFER = _BufferHandler()
+logging.getLogger().addHandler(LOG_BUFFER)
 
 # 兼容新版 Pillow
 if not hasattr(Image, 'ANTIALIAS'):
@@ -1319,72 +1345,83 @@ def main():
                     'error': f"未预期的异常: {str(e)}"
                 })
     
-    # 生成汇总报告 & 按需通知
+    # 生成汇总报告 & 通知（每次运行都发 TG 日报：成功报平安，失败附错误日志）
     logger.info("\n" + "=" * 60)
     logger.info("处理结果汇总")
     logger.info("=" * 60)
-    
-    # 判断是否需要发通知
-    notify_parts = []   # 需要通知的内容片段
+
     time_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    summary_lines = []   # 每个账号一行状态
+    has_failure = False
 
     for result in all_results:
         email = result['email']
         logger.info(f"\n账号: {email}")
 
         if not result['success']:
-            error_type = result.get('error_type', 'exception')
+            has_failure = True
             error_msg = result.get('error', '未知错误')
             logger.error(f"  ❌ 处理失败: {error_msg}")
-
-            # ① 登录失败 → 通知
-            if error_type == 'login':
-                notify_parts.append(
-                    f"<b>📧 {email}</b>\n  ❌ 登录处理失败: {error_msg}"
-                )
-            # ② 其他异常 → 通知
-            elif error_type == 'exception':
-                notify_parts.append(
-                    f"<b>📧 {email}</b>\n  ❌ 处理异常: {error_msg}"
-                )
+            summary_lines.append(
+                f"❌ <b>{html.escape(str(email))}</b>\n  处理失败: {html.escape(str(error_msg))}"
+            )
             continue
 
         servers = result.get('servers', {})
         logger.info(f"  服务器数量: {len(servers)}")
 
-        # ③ 获取服务器信息失败 → 通知
+        # 获取服务器信息失败
         if result.get('error_type') == 'get_servers':
+            has_failure = True
             logger.warning(f"  ⚠️ {result.get('error')}")
-            notify_parts.append(
-                f"<b>📧 {email}</b>\n  ⚠️ 获取服务器信息失败: {result.get('error')}"
+            summary_lines.append(
+                f"⚠️ <b>{html.escape(str(email))}</b>\n  获取服务器信息失败: {html.escape(str(result.get('error')))}"
             )
             continue
 
         renew_results = result.get('renew_results', [])
         if renew_results:
-            logger.info(f"  续期操作: {len(renew_results)} 个")
-            renew_lines = []
             for rr in renew_results:
+                ok = rr['success']
                 logger.info(f"    {rr['message']}")
-                renew_lines.append(f"  {rr['message']}")
-            # ④ 有续期操作（不管成功失败）→ 通知
-            notify_parts.append(
-                f"<b>📧 {email}</b>\n" + "\n".join(renew_lines)
-            )
+                if not ok:
+                    has_failure = True
+                summary_lines.append(
+                    f"{'✅' if ok else '❌'} <b>{html.escape(str(email))}</b> "
+                    f"订单 {html.escape(str(rr['order_id']))}: {'续期成功' if ok else '续期失败'}"
+                )
         else:
-            # ⑤ 无需续期 → 仅记录日志，不发通知
+            # 无需续期 → 报平安（含每台服务器的可续期日期）
             logger.info("  ✓ 所有服务器均无需续期")
-            for order_id, (can_renew, can_renew_date) in servers.items():
+            detail = "、".join(
+                f"{order_id}(可续期日期 {can_renew_date})" if can_renew_date else f"{order_id}"
+                for order_id, (_, can_renew_date) in servers.items()
+            ) or "未找到服务器"
+            for order_id, (_, can_renew_date) in servers.items():
                 if can_renew_date:
                     logger.info(f"    订单 {order_id}: 可续期日期 {can_renew_date}")
+            summary_lines.append(
+                f"✅ <b>{html.escape(str(email))}</b>\n  运行正常，无需续期：{html.escape(detail)}"
+            )
 
-    # 发送通知（同步调用，确保发送完成再退出）
-    if notify_parts:
-        header = f"<b>🔄 EUserv 续期通知</b>\n时间: {time_str}\n"
-        message = header + "\n\n".join(notify_parts)
-        send_notification("EUserv 续期通知", message, GLOBAL_CONFIG)
+    # 失败时附上最近的错误日志，方便直接定位（TG 单条 4096 字符，截断保护）
+    log_excerpt = ""
+    if has_failure:
+        err_lines = LOG_BUFFER.tail(level=logging.WARNING, limit=12)
+        if err_lines:
+            log_excerpt = ("\n\n<b>🧾 最近错误日志:</b>\n<pre>"
+                           + html.escape("\n".join(err_lines)[-1500:]) + "</pre>")
+
+    # 发送通知（同步调用，确保发送完成再退出；每次运行都发）
+    if summary_lines:
+        title = "EUserv 续期通知（有失败⚠️）" if has_failure else "EUserv 续期日报（正常✅）"
+        header = f"<b>🔄 EUserv 续期日报</b>\n时间: {time_str}\n"
+        message = header + "\n\n".join(summary_lines) + log_excerpt
+        if len(message) > 3900:
+            message = message[:3900] + "\n…(超长截断)"
+        send_notification(title, message, GLOBAL_CONFIG)
     else:
-        logger.info("✅ 本次无续期操作，无需发送通知")
+        logger.info("✅ 本次无账号被处理，无通知发送")
 
     logger.info("\n" + "=" * 60)
     logger.info("执行完成")
