@@ -16,7 +16,7 @@ import time
 import threading
 import logging
 from typing import Dict, List, Tuple, Optional
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from PIL import Image
@@ -46,6 +46,17 @@ ocr = ddddocr.DdddOcr(beta=True, show_ad=False)
 ocr_lock = threading.Lock()
 
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/94.0.4606.61 Safari/537.36"
+
+# 全局网络超时（秒）：所有 HTTP / IMAP 请求都带超时，避免连接被黑洞时无限挂起
+REQUEST_TIMEOUT = 30
+
+
+class _TimeoutSession(requests.Session):
+    """自动为每次请求补上默认超时的 Session（调用处显式传 timeout 时优先）"""
+
+    def request(self, method, url, **kwargs):
+        kwargs.setdefault('timeout', REQUEST_TIMEOUT)
+        return super().request(method, url, **kwargs)
 
 
 # ============== 工具函数 ==============
@@ -420,7 +431,10 @@ def get_euserv_pin(email: str, email_password: str, imap_server: str,
         retry_interval: 每轮间隔秒数（默认 5 秒）
         max_age_seconds: 最大 PIN 邮件时效（默认 90 秒，超过则跳过等待新邮件）
     """
-    cutoff = datetime.now() - timedelta(seconds=max_age_seconds)
+    # ★ 时区感知的时间比较：runner 本地时间(UTC) vs 邮件 Date 头(通常为欧洲时区)，
+    #   直接去 tzinfo 对比会把 2 小时前的旧邮件误判为"新鲜"。统一转成 UTC 再比较。
+    now_utc = datetime.now(timezone.utc)
+    cutoff = now_utc - timedelta(seconds=max_age_seconds)
     for attempt in range(1, max_retries + 1):
         try:
             if attempt > 1:
@@ -428,23 +442,30 @@ def get_euserv_pin(email: str, email_password: str, imap_server: str,
                 time.sleep(retry_interval)
 
             logger.info(f"正在从邮箱 {email} 获取 PIN 码（第 {attempt}/{max_retries} 次）...")
-            with MailBox(imap_server).login(email, email_password) as mailbox:
+            with MailBox(imap_server, timeout=REQUEST_TIMEOUT).login(email, email_password) as mailbox:
                 for msg in mailbox.fetch(AND(from_='no-reply@euserv.com', body='PIN'), limit=1, reverse=True):
                     logger.debug(f"找到邮件: {msg.subject}, 收件时间: {msg.date_str}")
 
                     # ★ 时效性校验：跳过旧邮件，等新的 PIN 邮件
                     msg_date = msg.date
-                    if msg_date and msg_date.replace(tzinfo=None) < cutoff:
-                        logger.info(f"PIN 邮件时间 {msg_date} 超过 {max_age_seconds}s，可能为旧 PIN，等待新邮件...")
-                        continue
+                    if msg_date:
+                        msg_utc = msg_date if msg_date.tzinfo else msg_date.replace(tzinfo=timezone.utc)
+                        if msg_utc < cutoff:
+                            logger.info(f"PIN 邮件时间 {msg_date} 超过 {max_age_seconds}s，可能为旧 PIN，等待新邮件...")
+                            continue
 
-                    match = re.search(r'PIN:\s*\n?(\d{6})', msg.text)
+                    # ★ PIN 可能只在 HTML 部分：纯文本取不到时剥离 HTML 标签再找
+                    body_text = msg.text or ""
+                    if not re.search(r'PIN', body_text) and msg.html:
+                        body_text = re.sub(r'<[^>]+>', ' ', msg.html)
+
+                    match = re.search(r'PIN:\s*\n?(\d{6})', body_text)
                     if match:
                         pin = match.group(1)
                         logger.info(f"✅ 提取到 PIN 码: {pin}")
                         return pin
                     else:
-                        match_fallback = re.search(r'(\d{6})', msg.text)
+                        match_fallback = re.search(r'(\d{6})', body_text)
                         if match_fallback:
                             pin = match_fallback.group(1)
                             logger.warning(f"⚠️ 备选匹配 PIN 码: {pin}")
@@ -470,7 +491,8 @@ class EUserv:
 
     def __init__(self, config: AccountConfig):
         self.config = config
-        self.session = requests.Session()
+        # 带默认超时的 Session：网络抖动/被黑洞时不再无限挂起
+        self.session = _TimeoutSession()
         self.sess_id = None
         self.c_id = None
         # 每个账号对应一个独立的 cookie 文件
@@ -593,7 +615,12 @@ class EUserv:
                         logger.error("❌ 验证码识别失败")
                         return False
 
+                    # 验证码重试提交：按浏览器行为重提整个登录表单（含账号密码），只补 captcha_code
                     captcha_data = {
+                        'email': self.config.email,
+                        'password': self.config.password,
+                        'form_selected_language': 'en',
+                        'Submit': 'Login',
                         'subaction': 'login',
                         'sess_id': sess_id,
                         'captcha_code': captcha_code
@@ -617,7 +644,11 @@ class EUserv:
             # 处理 PIN 验证
             # 若之前 Cookie 有效，服务器不会返回 PIN 页面，直接跳过这段
             if 'PIN that you receive via email' in response.text:
-                self.c_id = soup.find("input", {"name": "c_id"})["value"]
+                c_id_tag = soup.find("input", {"name": "c_id"})
+                if not c_id_tag or not c_id_tag.get("value"):
+                    logger.error("❌ PIN 页面缺少 c_id 字段，EUserv 页面结构可能已变化")
+                    return False
+                self.c_id = c_id_tag["value"]
                 logger.info("⚠️ 需要 PIN 验证（首次登录或 Cookie 已失效）")
                 time.sleep(8)  # ★ 等邮件送达
 
@@ -1195,15 +1226,39 @@ def main():
     if not ACCOUNTS:
         logger.error("❌ 未配置任何账号")
         sys.exit(1)
-    
+
+    # ★ 配置完整性检查：EUSERV_EMAIL 配了但 EUSERV_PASSWORD 为空的账号会被静默跳过，
+    #   历史上这曾导致"8 秒跑完、Actions 全绿、实际什么都没做"。这里必须大声报错。
+    def _account_usable(a: AccountConfig) -> bool:
+        # email_password 在 AccountConfig 里已回退为 password，因此只校验 email + password
+        return bool(a.email and str(a.email).strip()
+                    and a.password and str(a.password).strip())
+
+    usable_accounts = [a for a in ACCOUNTS if _account_usable(a)]
+    skipped_accounts = [a for a in ACCOUNTS if not _account_usable(a)]
+    for a in skipped_accounts:
+        logger.error(
+            f"❌ 账号 '{(a.email or '').strip() or '(空邮箱)'}' 配置不完整 "
+            f"(EUSERV_PASSWORD 未设置或为空)，已被跳过！请检查 Secrets/环境变量。"
+        )
+    if not usable_accounts:
+        err_msg = ("❌ 没有可用账号：所有账号均因 EUSERV_PASSWORD 缺失/为空被跳过，"
+                   "本次未执行任何续期！请检查 Secrets 配置。")
+        logger.error(err_msg)
+        send_notification(
+            "EUserv 续期通知",
+            f"<b>🔄 EUserv 续期通知</b>\n时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n{err_msg}",
+            GLOBAL_CONFIG,
+        )
+        sys.exit(2)
+
     # 使用线程池处理多个账号
     all_results = []
     with ThreadPoolExecutor(max_workers=GLOBAL_CONFIG.max_workers) as executor:
         # 提交所有任务
         future_to_account = {
-            executor.submit(process_account, account, GLOBAL_CONFIG): account 
-            for account in ACCOUNTS
-            if account.email and str(account.email).strip() and account.password and str(account.password).strip() and account.email_password and str(account.email_password).strip()
+            executor.submit(process_account, account, GLOBAL_CONFIG): account
+            for account in usable_accounts
         }
         
         # 等待任务完成
@@ -1286,10 +1341,19 @@ def main():
         send_notification("EUserv 续期通知", message, GLOBAL_CONFIG)
     else:
         logger.info("✅ 本次无续期操作，无需发送通知")
-    
+
     logger.info("\n" + "=" * 60)
     logger.info("执行完成")
     logger.info("=" * 60)
+
+    # ★ 诚实的退出码：只要有账号发生登录失败/处理异常，就让 Actions 变红，
+    #   不再出现"全绿但实际失败"的误导。2=配置问题(上游已退出)，3=运行期硬失败。
+    hard_failed = [r for r in all_results
+                   if not r.get('success') and r.get('error_type') in ('login', 'exception')]
+    if hard_failed:
+        failed_emails = ", ".join(r.get('email', '?') for r in hard_failed)
+        logger.error(f"❌ {len(hard_failed)} 个账号处理失败: {failed_emails}")
+        sys.exit(3)
     sys.exit(0)
 
 
