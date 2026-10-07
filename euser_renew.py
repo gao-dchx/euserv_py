@@ -415,13 +415,34 @@ def calculate_operation(left: int, op: str, right: int, raw_text: str, silent: b
 
 
 
+def get_latest_pin_uid(email: str, email_password: str, imap_server: str) -> int:
+    """返回当前最新一封 EUserv PIN 邮件的 UID（没有则返回 0）。
+
+    用于续期流程：在触发发送 PIN 之前记录 UID，之后只接受 UID 更大的新邮件，
+    从根源上避免"续期 PIN 迟到、误用了几分钟前的登录 PIN"导致的续期失败。
+    """
+    try:
+        with MailBox(imap_server, timeout=REQUEST_TIMEOUT).login(email, email_password) as mailbox:
+            msgs = list(mailbox.fetch(AND(from_='no-reply@euserv.com', body='PIN'), limit=1, reverse=True))
+            if msgs:
+                try:
+                    return int(msgs[0].uid)
+                except (TypeError, ValueError):
+                    return 0
+            return 0
+    except Exception as e:
+        logger.warning(f"⚠️ 读取 PIN 邮件 UID 失败（将不做 UID 隔离）: {e}")
+        return 0
+
+
 def get_euserv_pin(email: str, email_password: str, imap_server: str,
                    max_retries: int = 6, retry_interval: int = 5,
-                   max_age_seconds: int = 90) -> Optional[str]:
-    """从邮箱获取 EUserv PIN 码（带轮询重试 + 时效性校验）
+                   max_age_seconds: int = 90, min_uid: int = 0) -> Optional[str]:
+    """从邮箱获取 EUserv PIN 码（带轮询重试 + 时效性校验 + UID 新邮件隔离）
 
     因 PIN 邮件可能有延迟，会按 retry_interval 秒间隔最多重试 max_retries 次。
     只接受 max_age_seconds 秒内发送的 PIN，避免拿到旧 PIN 导致续期失败。
+    min_uid > 0 时，只接受 UID 大于 min_uid 的新邮件（用于续期流程隔离登录 PIN）。
 
     Args:
         email: 邮箱地址
@@ -430,6 +451,7 @@ def get_euserv_pin(email: str, email_password: str, imap_server: str,
         max_retries: 最大重试次数（默认 6 次）
         retry_interval: 每轮间隔秒数（默认 5 秒）
         max_age_seconds: 最大 PIN 邮件时效（默认 90 秒，超过则跳过等待新邮件）
+        min_uid: 只接受 UID 大于此值的新邮件（默认 0，不过滤）
     """
     # ★ 时区感知的时间比较：runner 本地时间(UTC) vs 邮件 Date 头(通常为欧洲时区)，
     #   直接去 tzinfo 对比会把 2 小时前的旧邮件误判为"新鲜"。统一转成 UTC 再比较。
@@ -445,6 +467,16 @@ def get_euserv_pin(email: str, email_password: str, imap_server: str,
             with MailBox(imap_server, timeout=REQUEST_TIMEOUT).login(email, email_password) as mailbox:
                 for msg in mailbox.fetch(AND(from_='no-reply@euserv.com', body='PIN'), limit=1, reverse=True):
                     logger.debug(f"找到邮件: {msg.subject}, 收件时间: {msg.date_str}")
+
+                    # ★ UID 隔离：只接受触发之后的新邮件（防"续期 PIN 迟到误用登录 PIN"）
+                    if min_uid:
+                        try:
+                            msg_uid = int(msg.uid)
+                        except (TypeError, ValueError):
+                            msg_uid = 0
+                        if msg_uid <= min_uid:
+                            logger.info(f"最新 PIN 邮件 UID={msg_uid} 不大于触发前 UID={min_uid}，仍在等待新的 PIN 邮件...")
+                            continue
 
                     # ★ 时效性校验：跳过旧邮件，等新的 PIN 邮件
                     msg_date = msg.date
@@ -949,8 +981,22 @@ class EUserv:
             }
             resp1 = self.session.post(url, headers=headers, data=data)
             resp1.raise_for_status()
+            # ★ 软校验：订单选择页应包含订单号，否则后续步骤可能白跑
+            if order_id not in resp1.text:
+                logger.warning(f"⚠️ 选择订单后返回页未见订单号 {order_id}，页面结构可能变化，继续尝试后续步骤...")
             
             # 步骤2: 触发发送 PIN
+            # ★ 先记录当前最新 PIN 邮件的 UID，之后只接受 UID 更大的新邮件。
+            #   否则续期 PIN 若迟到，会误抓几分钟前的登录 PIN 去提交，导致 token 失败
+            #   （用户能收到真正的续期 PIN，但脚本已经用了错的 PIN——这正是历史失败的主因）。
+            logger.debug("步骤2: 记录触发前的最新 PIN 邮件 UID...")
+            uid_before = get_latest_pin_uid(
+                self.config.email_pin,
+                self.config.email_password,
+                self.config.imap_server,
+            )
+            logger.debug(f"触发前最新 PIN 邮件 UID={uid_before}")
+
             logger.debug("步骤2: 触发发送 PIN...")
             data = {
                 'sess_id': self.sess_id,
@@ -965,21 +1011,20 @@ class EUserv:
                 logger.error("❌ PIN发送请求失败")
                 return False
 
-            # ★ 等待 PIN 邮件送达邮箱（IMAP 延迟通常 5-15 秒）
-            logger.info("⏳ 等待 PIN 邮件送达...（15 秒）")
-            time.sleep(15)
-
-            # 步骤3: 获取 PIN（内部有轮询重试）
-            logger.debug("步骤3: 获取 PIN 码...")
+            # 步骤3: 获取 PIN（只认触发之后的新邮件；轮询最多约 150 秒，覆盖邮件延迟）
+            logger.debug("步骤3: 获取 PIN 码（等待触发后的新邮件）...")
             pin = get_euserv_pin(
                 self.config.email_pin,
                 self.config.email_password,
                 self.config.imap_server,
-                max_age_seconds=60  # ★ 只接受最近 60 秒内的 PIN
+                max_retries=15,      # ★ 15 次 × 10 秒 ≈ 150 秒，覆盖 EUserv 邮件延迟
+                retry_interval=10,
+                max_age_seconds=180,  # ★ 新邮件放宽到 180 秒时效（配合 UID 隔离，双保险）
+                min_uid=uid_before,  # ★ 只接受触发后的新邮件
             )
-            
+
             if not pin:
-                logger.error("❌ 获取续期 PIN 码失败")
+                logger.error("❌ 获取续期 PIN 码失败（150 秒内未收到触发后的新 PIN 邮件）")
                 return False
         
             # 步骤4: 验证 PIN 获取 token
@@ -998,9 +1043,8 @@ class EUserv:
 
             result = json.loads(resp3.text)
             if result.get('rs') != 'success':
-                logger.error(f"❌ 获取 token 失败: {result.get('rs', 'unknown')}")
-                if 'error' in result:
-                    logger.error(f"错误信息: {result['error']}")
+                # ★ 把服务端返回完整打出来，下次失败时日志里直接能看到原因
+                logger.error(f"❌ 获取 token 失败: rs={result.get('rs', 'unknown')}, 完整返回={resp3.text[:500]}")
                 return False
             
             token = result['token']['value']
