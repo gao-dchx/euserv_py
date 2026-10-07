@@ -48,7 +48,10 @@ jobs:
         run: python euser_renew.py
 
 # --- action保活 ---
+      # 即使续期脚本失败也照常提交（if: always），保持仓库活跃度，
+      # 避免 GitHub 因长期无活动自动停用定时任务；失败本身会由脚本的非零退出码标红。
       - name: Keep Alive Action
+        if: always()
         run: |
           date > last_run.txt
           git config --global user.name "github-actions[bot]"
